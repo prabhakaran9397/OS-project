@@ -1,0 +1,728 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+import argparse
+import fcntl
+import gzip
+import io
+import os
+import readline
+import signal
+import struct
+import sys
+import tempfile
+import termios
+import textwrap
+import webbrowser
+
+if sys.version_info > (3,):
+    from html.entities import name2codepoint
+    import html.parser as HTMLParser
+    from urllib.parse import (
+        urljoin,
+        quote_plus as url_quote_plus,
+        unquote as url_unquote,
+    )
+    from http.client import HTTPSConnection
+
+    unichr = chr
+    raw_input = input
+else:
+    from htmlentitydefs import name2codepoint
+    import HTMLParser
+    from urllib import (
+        quote_plus as url_quote_plus,
+        unquote as url_unquote,
+    )
+    from urlparse import urljoin
+    from httplib import HTTPSConnection
+
+    # Set the encoding of standard streams to UTF-8 (unnecessary for Python 3)
+    import codecs
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout)
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr)
+
+def sigint_handler(signum, frame):
+    print('\nInterrupted.', file=sys.stderr)
+    sys.exit(1)
+
+signal.signal(signal.SIGINT, sigint_handler)
+
+
+columns = None    # Terminal window size.
+start = "0"       # The first result to display (option -s)
+num = None        # Number of results to display (option -n)
+lang = None       # Language to search for (option -l)
+openUrl = False   # If True, opens the first URL in browser (option -j)
+colorize = True   # If True, colorizes the output (option -C)
+duration = None   # Time limit search (option -t) [e.g. h5, d5, w5, m5, y5]
+conn = None       # Use a single global connection during navigation
+nav = "n"         # For user navigation
+skipped = 0       # Count for skipped ads or blank links
+debug = False     # Print debug logs
+news = False      # Read news
+exact = False     # If True, disable automatic spelling correction
+server = "www.google.com"
+ua = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/42.0.2311.135 Safari/537.36 Edge/12.10240')
+
+class GoogleParser(HTMLParser.HTMLParser):
+
+    def __init__(self):
+        HTMLParser.HTMLParser.__init__(self)
+        self.handle_starttag = self.main_start
+        self.handle_data = self.main_data
+        self.handle_endtag = self.main_end
+        # Use stacks to keep track of the hirarchy of entityref/charref handlers
+        self.old_entityref_handlers = [self.handle_entityref]
+        self.old_charref_handlers = [self.handle_charref]
+        self.results = []
+
+    def main_start(self, tag, attrs):
+        if tag == "div" and len(attrs) > 0 and attrs[0] == ("class", "g"):
+            self.title = ""
+            self.url = ""
+            self.text = ""
+            self.handle_starttag = self.div_outer_start
+            self.handle_data = self.div_outer_data
+            self.handle_endtag = self.div_outer_end
+
+    def main_data(self, data):
+        pass
+
+    def main_end(self, tag):
+        pass
+
+    # outer <div class="g"> ... </div>
+    def div_outer_start(self, tag, attrs):
+        if tag == "h3":
+            self.handle_starttag = self.h3_start
+            self.handle_data = self.h3_data
+            self.register_entityref_and_charref_handlers('title')
+            self.handle_endtag = self.h3_end
+        elif tag == "div" and len(attrs) > 0 and attrs[0] == ("class", "s"):
+            self.handle_starttag = self.div_inner_start
+            self.handle_data = self.div_inner_data
+            self.handle_endtag = self.div_inner_end
+
+    def div_outer_data(self, data):
+        global news
+
+        if news:
+            if data == '-':
+                self.text += ', '
+            else:
+                self.text += data
+        else:
+            pass
+
+    def div_outer_end(self, tag):
+        global skipped
+
+        if tag == "div":
+            marker = self.url.find("?q=")
+            if marker >= 0:
+                self.url = self.url[marker + 3:]
+            marker = self.url.find("&sa")
+            if marker >= 0:
+                self.url = self.url[:marker]
+
+            if self.url != "":
+                if self.url.find("://", 0, 12) >= 0:
+                    index = len(self.results) + 1
+                    self.results.append(Result(index, self.title,
+                                               url_unquote(self.url),
+                                               self.text))
+                else:
+                    skipped += 1
+
+            self.handle_starttag = self.main_start
+            self.handle_data = self.main_data
+            self.handle_endtag = self.main_end
+
+    # <h3> ... </h3>
+    def h3_start(self, tag, attrs):
+        if tag == "a":
+            for name, value in attrs:
+                if name == "href":
+                    self.url = value
+
+    def h3_data(self, data):
+        self.title += data
+
+    def h3_end(self, tag):
+        if tag == "h3":
+            self.handle_starttag = self.div_outer_start
+            self.handle_data = self.div_outer_data
+            self.restore_entityref_and_charref_handlers()
+            self.handle_endtag = self.div_outer_end
+
+    # inner <div> ... </div>
+    def div_inner_start(self, tag, attrs):
+        if tag == "span" and len(attrs) > 0 and attrs[0] == ("class", "st"):
+            self.handle_starttag = self.span_outer_start
+            self.handle_data = self.span_outer_data
+            self.register_entityref_and_charref_handlers('text')
+            self.handle_endtag = self.span_outer_end
+
+    def div_inner_data(self, data):
+        pass
+
+    def div_inner_end(self, tag):
+        pass
+
+    def span_outer_start(self, tag, attrs):
+        if tag == "span" and len(attrs) > 0 and attrs[0] == ("class", "f"):
+            self.handle_starttag = self.span_inner_start
+            self.handle_data = self.span_inner_data
+            self.register_entityref_and_charref_handlers('text')
+            self.handle_endtag = self.span_inner_end
+
+    def span_outer_data(self, data):
+        self.text += data
+
+    def span_outer_end(self, tag):
+        if tag == "span":
+            self.handle_starttag = self.div_outer_start
+            self.handle_data = self.div_outer_data
+            self.restore_entityref_and_charref_handlers()
+            self.handle_endtag = self.div_outer_end
+
+    def span_inner_start(self, tag, start):
+        pass
+
+    def span_inner_data(self, data):
+        self.text += data
+
+    def span_inner_end(self, tag):
+        if tag == "span":
+            self.handle_starttag = self.span_outer_start
+            self.handle_data = self.span_outer_data
+            self.restore_entityref_and_charref_handlers()
+            self.handle_endtag = self.span_outer_end
+
+    def register_entityref_and_charref_handlers(self, dest):
+        self.old_entityref_handlers.append(self.handle_entityref)
+        self.old_charref_handlers.append(self.handle_charref)
+        self.handle_entityref = lambda ref: self.entityref(dest, ref)
+        self.handle_charref = lambda ref: self.charref(dest, ref)
+
+    def restore_entityref_and_charref_handlers(self):
+        self.handle_entityref = self.old_entityref_handlers.pop()
+        self.handle_charref = self.old_charref_handlers.pop()
+
+    def entityref(self, dest, ref):
+        try:
+            char = unichr(name2codepoint[ref])
+            setattr(self, dest, getattr(self, dest) + char)
+        except KeyError:
+            setattr(self, dest, getattr(self, dest) + '&' + ref)
+
+    def charref(self, dest, ref):
+        if ref.startswith('x'):
+            char = unichr(int(ref[1:], 16))
+        else:
+            char = unichr(int(ref))
+        setattr(self, dest, getattr(self, dest) + char)
+
+
+class Result:
+
+    def __init__(self, index, title, url, text):
+        self.index = index
+        self.title = title
+        self.url = url
+        self.text = text
+
+    def print_entry(self):
+        index = self.index
+        title = self.title
+        url = self.url
+        text = self.text
+
+        # Open the URL in a web browser if option -j was specified.
+        if openUrl:
+            self.open()
+            quit(conn)
+
+        # Print the title and the URL.
+        if colorize:
+            print("\x1B[1m\x1B[36m", index, "\x1B[92m", title,
+                  "\x1B[0m\n\x1B[93m%s\x1B[39m" % url)
+        else:
+            print("", index, title, "\n%s" % url)
+        # Hard wrap text if the number of columns is available.
+        if columns > 0:
+            col = 0
+            for w in text.split():
+                if (col + len(w) + 1) > columns:
+                    col = 0
+                    print()
+                print(w, end=' ')
+                col += len(w) + 1
+            print("\n")
+        else:
+            print("%s\n" % text.replace("\n", " "))
+
+    def open(self):
+        _stderr = os.dup(2)
+        os.close(2)
+        _stdout = os.dup(1)
+        os.close(1)
+        fd = os.open(os.devnull, os.O_RDWR)
+        os.dup2(fd, 2)
+        os.dup2(fd, 1)
+        try:
+            webbrowser.open(self.url)
+        finally:
+            os.close(fd)
+            os.dup2(_stderr, 2)
+            os.dup2(_stdout, 1)
+
+
+# Functions
+
+def is_int(string):
+    try:
+        int(string)
+        return True
+    except:
+        return False
+
+def server_url(tld):
+    # Data source: https://en.wikipedia.org/wiki/List_of_Google_domains
+    # Scraper script: https://gist.github.com/zmwangx/b976e83c14552fe18b71
+    tld_to_domain_map = {
+        'ac': 'google.ac',      'ad': 'google.ad',      'ae': 'google.ae',
+        'af': 'google.com.af',  'ag': 'google.com.ag',  'ai': 'google.com.ai',
+        'al': 'google.al',      'am': 'google.am',      'ao': 'google.co.ao',
+        'ar': 'google.com.ar',  'as': 'google.as',      'at': 'google.at',
+        'au': 'google.com.au',  'az': 'google.az',      'ba': 'google.ba',
+        'bd': 'google.com.bd',  'be': 'google.be',      'bf': 'google.bf',
+        'bg': 'google.bg',      'bh': 'google.com.bh',  'bi': 'google.bi',
+        'bj': 'google.bj',      'bn': 'google.com.bn',  'bo': 'google.com.bo',
+        'br': 'google.com.br',  'bs': 'google.bs',      'bt': 'google.bt',
+        'bw': 'google.co.bw',   'by': 'google.by',      'bz': 'google.com.bz',
+        'ca': 'google.ca',      'cat': 'google.cat',    'cc': 'google.cc',
+        'cd': 'google.cd',      'cf': 'google.cf',      'cg': 'google.cg',
+        'ch': 'google.ch',      'ci': 'google.ci',      'ck': 'google.co.ck',
+        'cl': 'google.cl',      'cm': 'google.cm',      'cn': 'google.cn',
+        'co': 'google.com.co',  'cr': 'google.co.cr',   'cu': 'google.com.cu',
+        'cv': 'google.cv',      'cy': 'google.com.cy',  'cz': 'google.cz',
+        'de': 'google.de',      'dj': 'google.dj',      'dk': 'google.dk',
+        'dm': 'google.dm',      'do': 'google.com.do',  'dz': 'google.dz',
+        'ec': 'google.com.ec',  'ee': 'google.ee',      'eg': 'google.com.eg',
+        'es': 'google.es',      'et': 'google.com.et',  'fi': 'google.fi',
+        'fj': 'google.com.fj',  'fm': 'google.fm',      'fr': 'google.fr',
+        'ga': 'google.ga',      'ge': 'google.ge',      'gf': 'google.gf',
+        'gg': 'google.gg',      'gh': 'google.com.gh',  'gi': 'google.com.gi',
+        'gl': 'google.gl',      'gm': 'google.gm',      'gp': 'google.gp',
+        'gr': 'google.gr',      'gt': 'google.com.gt',  'gy': 'google.gy',
+        'hk': 'google.com.hk',  'hn': 'google.hn',      'hr': 'google.hr',
+        'ht': 'google.ht',      'hu': 'google.hu',      'id': 'google.co.id',
+        'ie': 'google.ie',      'il': 'google.co.il',   'im': 'google.im',
+        'in': 'google.co.in',   'io': 'google.io',      'iq': 'google.iq',
+        'is': 'google.is',      'it': 'google.it',      'je': 'google.je',
+        'jm': 'google.com.jm',  'jo': 'google.jo',      'jp': 'google.co.jp',
+        'ke': 'google.co.ke',   'kg': 'google.kg',      'kh': 'google.com.kh',
+        'ki': 'google.ki',      'kr': 'google.co.kr',   'kw': 'google.com.kw',
+        'kz': 'google.kz',      'la': 'google.la',      'lb': 'google.com.lb',
+        'lc': 'google.com.lc',  'li': 'google.li',      'lk': 'google.lk',
+        'ls': 'google.co.ls',   'lt': 'google.lt',      'lu': 'google.lu',
+        'lv': 'google.lv',      'ly': 'google.com.ly',  'ma': 'google.co.ma',
+        'md': 'google.md',      'me': 'google.me',      'mg': 'google.mg',
+        'mk': 'google.mk',      'ml': 'google.ml',      'mm': 'google.com.mm',
+        'mn': 'google.mn',      'ms': 'google.ms',      'mt': 'google.com.mt',
+        'mu': 'google.mu',      'mv': 'google.mv',      'mw': 'google.mw',
+        'mx': 'google.com.mx',  'my': 'google.com.my',  'mz': 'google.co.mz',
+        'na': 'google.com.na',  'ne': 'google.ne',      'nf': 'google.com.nf',
+        'ng': 'google.com.ng',  'ni': 'google.com.ni',  'nl': 'google.nl',
+        'no': 'google.no',      'np': 'google.com.np',  'nr': 'google.nr',
+        'nu': 'google.nu',      'nz': 'google.co.nz',   'om': 'google.com.om',
+        'pa': 'google.com.pa',  'pe': 'google.com.pe',  'pg': 'google.com.pg',
+        'ph': 'google.com.ph',  'pk': 'google.com.pk',  'pl': 'google.pl',
+        'pn': 'google.co.pn',   'pr': 'google.com.pr',  'ps': 'google.ps',
+        'pt': 'google.pt',      'py': 'google.com.py',  'qa': 'google.com.qa',
+        'ro': 'google.ro',      'rs': 'google.rs',      'ru': 'google.ru',
+        'rw': 'google.rw',      'sa': 'google.com.sa',  'sb': 'google.com.sb',
+        'sc': 'google.sc',      'se': 'google.se',      'sg': 'google.com.sg',
+        'sh': 'google.sh',      'si': 'google.si',      'sk': 'google.sk',
+        'sl': 'google.com.sl',  'sm': 'google.sm',      'sn': 'google.sn',
+        'so': 'google.so',      'sr': 'google.sr',      'st': 'google.st',
+        'sv': 'google.com.sv',  'td': 'google.td',      'tg': 'google.tg',
+        'th': 'google.co.th',   'tj': 'google.com.tj',  'tk': 'google.tk',
+        'tl': 'google.tl',      'tm': 'google.tm',      'tn': 'google.tn',
+        'to': 'google.to',      'tr': 'google.com.tr',  'tt': 'google.tt',
+        'tw': 'google.com.tw',  'tz': 'google.co.tz',   'ua': 'google.com.ua',
+        'ug': 'google.co.ug',   'uk': 'google.co.uk',   'uy': 'google.com.uy',
+        'uz': 'google.co.uz',   'vc': 'google.com.vc',  've': 'google.co.ve',
+        'vg': 'google.vg',      'vi': 'google.co.vi',   'vn': 'google.com.vn',
+        'vu': 'google.vu',      'ws': 'google.ws',      'za': 'google.co.za',
+        'zm': 'google.co.zm',   'zw': 'google.co.zw',
+    }
+
+    try:
+        # Use www subdomain
+        return 'www.' + tld_to_domain_map[tld]
+    except KeyError:
+        return 'www.google.com'
+
+
+# Send a GET request to Google with the appropriate headers.
+# url can be relative (to the appropriate Google domain).
+def google_get(conn, url):
+    global ua
+    conn.request("GET", url, None, {
+        "Accept-encoding": "gzip",
+        "User-Agent": ua,
+    })
+    return conn.getresponse()
+
+
+# Returns a new connection to the given domain with appropriate options.
+# When the given domain is absent, the global variable server is used
+# instead.
+def new_connection(domain=None):
+    global server
+    return HTTPSConnection(domain if domain else server, timeout=45)
+
+
+# Closes a connection and quits the program
+def quit(conn):
+    conn.close()
+    sys.exit(1)
+
+
+# Show the search or navigation omniprompt:
+def show_omniprompt():
+    global colorize
+
+    message = "Enter n, p, result number or new keywords"
+    if colorize:
+        return raw_input("\x1b[7m%s\x1b[0m " % message)
+    else:
+        return raw_input("%s: " % message)
+
+
+# Messaging wrappers
+
+# Print message, led with [%(level)s] where level is a string, to
+# stderr.  If ansi is not None and the global variable colorize is True,
+# then print ansi at the beginning, and close with \x1b[0m.
+def message(msg, level="INFO", ansi=None):
+    global colorize
+
+    if ansi is not None and colorize:
+        opening = ansi
+        closing = "\x1b[0m"
+    else:
+        opening = closing = ""
+    print("{opening}[{level}] {msg}{closing}".format(
+        opening=opening, level=level, msg=msg, closing=closing
+    ), file=sys.stderr)
+
+
+# Print error message.
+def error(msg):
+    # Error in red if colorize
+    message(msg, "ERROR", "\x1b[31m")
+
+
+# Print warning message.
+def warning(msg):
+    # Warning in yellow if colorize
+    message(msg, "WARNING", "\x1b[33m")
+
+
+# Print debug message.
+#
+# debugp stands for "debug print". The name `debug' was already taken,
+# so we had to choose something else.
+def debugp(msg):
+    global debug
+
+    if debug:
+        # Debugging messages not colorized
+        message(msg, "DEBUG")
+
+
+# Print message, verbatim, to stderr.
+def printerr(msg):
+    print(msg, file=sys.stderr)
+
+
+# Program Main
+
+# Process command line options.
+optlist = None
+keywords = None
+
+class ExtendedArgumentParser(argparse.ArgumentParser):
+
+    # Augment print_help to print more than synopsis and options
+    def print_help(self, file=None):
+        super(ExtendedArgumentParser, self).print_help(file)
+        file.write(textwrap.dedent("""
+        prompt keys:
+          g terms  initiate a new search for 'terms' with original options
+          n, p     fetch next or previous set of search results
+          1-N      open the Nth result index in browser
+          Enter    exit googler (same behaviour for an empty search)
+          *        any other string initiates a new search with original options
+        """))
+
+    # Automatically print full help text on error
+    def error(self, message):
+        sys.stderr.write('%s: error: %s\n\n' % (self.prog, message))
+        self.print_help(sys.stderr)
+        self.exit(2)
+
+def is_duration(arg):
+    """Check if a string is a valid duration accepted by Google.
+
+    A valid duration is of the form dNUM, where d is a single letter h
+    (hour), d (day), w (week), m (month), or y (year), and NUM is a
+    nonnegative integer.
+    """
+    try:
+        if arg[0] not in ('h', 'd', 'w', 'm', 'y') or int(arg[1:]) < 0:
+            raise ValueError
+    except (TypeError, IndexError, ValueError):
+        raise argparse.ArgumentTypeError('%s is not a valid duration' % arg)
+    return arg
+
+argparser = ExtendedArgumentParser(
+    add_help=False,
+    description='Perform a Google search and print results to stdout.'
+)
+addarg = argparser.add_argument
+addarg('-s', dest='start', type=int, metavar='N',
+       help='start at the Nth result')
+addarg('-n', dest='num', type=int, metavar='N',
+       help='show N results (default 10)')
+addarg('-N', dest='news', action='store_true',
+       help='show results from news section')
+addarg('-c', dest='tld', metavar='TLD',
+       help="""country-specific search with top-level domain .TLD, e.g., 'in'
+       for India (see https://en.wikipedia.org/wiki/List_of_Google_domains for
+       a full list of TLDs)""")
+addarg('-l', dest='lang', metavar='LANG',
+       help='display in language LANG')
+addarg('-x', dest='exact', action='store_true',
+       help='disable automatic spelling correction')
+addarg('-C', dest='colorize', action='store_false',
+       help='disable color output')
+addarg('-j', dest='openUrl', action='store_true',
+       help='open the first result in a web browser')
+addarg('-t', dest='duration', type=is_duration, metavar='dN',
+       help='time limit search '
+       '[h5 (5 hrs), d5 (5 days), w5 (5 weeks), m5 (5 months), y5 (5 years)]')
+addarg('-d', dest='debug', action='store_true',
+       help='enable debugging')
+addarg('keywords', nargs='+', metavar='KEYWORD',
+       help='search keywords')
+
+if len(sys.argv) < 2:
+    argparser.print_help(sys.stderr)
+    sys.exit(1)
+
+args = argparser.parse_args()
+if args.start:
+    start = str(args.start)
+if args.num:
+    num = str(args.num)
+news = args.news
+if args.tld:
+    server = server_url(args.tld)
+lang = args.lang
+exact = args.exact
+colorize = args.colorize
+openUrl = args.openUrl
+duration = args.duration
+debug = args.debug
+keywords = args.keywords
+
+
+# Construct the query URL.
+url = "/search?ie=UTF-8&oe=UTF-8&"
+
+if start is not None:
+    url += "start=" + start + "&"
+if num is not None:
+    url += "num=" + num + "&"
+if news:
+    url += "tbm=nws&"
+if lang is not None:
+    url += "hl=" + lang + "&"
+if duration is not None:
+    url += "tbs=qdr:" + duration + "&"
+if exact:
+    url += "nfpr=1&"
+
+baseurl = url
+basestart = start
+
+debugp("Base URL [%s]" % url)
+
+url += "q=" + url_quote_plus(keywords[0])
+for kw in keywords[1:]:
+    url += "+" + url_quote_plus(kw)
+
+debugp("Search URL [%s : %s]" % (server, url))
+
+# Get the terminal window size.
+try:
+    winsz = fcntl.ioctl(sys.stderr, termios.TIOCGWINSZ, "1234")
+    columns = struct.unpack("HH", winsz)[1]
+
+    if columns <= 0:
+        columns = int(os.environ.get('COLUMNS', 0))
+except IOError:
+    columns = 0
+
+# Connect to Google and request the result page.
+conn = new_connection()
+
+
+def fetch_results():
+    global conn
+    global url
+    global skipped
+
+    try:
+        resp = google_get(conn, url)
+    except Exception as e:
+        debugp("Exception: %s" % e)
+        conn.close()
+        conn = new_connection()
+        resp = google_get(conn, url)
+
+    if resp.status != 200:
+        if resp.status in (301, 302,):
+            url = urljoin(url, resp.getheader('location', ''))
+            debugp("Redirected URL [%s]" % url)
+            if url.find("sorry/IndexRedirect?") >= 0:
+                error("Connection blocked due to unusual activity.")
+                quit(conn)
+
+            conn.close()
+            next_server = url[(url.find("//") + 2):url.find("/search")]
+            debugp("Next Server [%s]" % next_server)
+            conn = new_connection(next_server)
+            url = url[url.find("/search"):]
+            debugp("Next GET [%s]" % url)
+
+            try:
+                resp = google_get(conn, url)
+            except Exception as e:
+                debugp("Exception: %s" % e)
+                quit(conn)
+
+            if resp.status != 200:
+                # Failed connecting to redirected server too!
+                error("First redirection failed with HTTP %d: %s" %
+                      (resp.status, resp.reason))
+                quit(conn)
+        else:
+            # The server responded with an error.
+            error("HTTP %d: %s" % (resp.status, resp.reason))
+            quit(conn)
+
+    # Parse the HTML document and print the results.
+    parser = GoogleParser()
+    resp_body = gzip.GzipFile(fileobj=io.BytesIO(resp.read())).read().decode('utf-8')
+
+    if debug:
+        fd, tmpfile = tempfile.mkstemp(prefix='googler-response-')
+        os.close(fd)
+        with open(tmpfile, 'wb') as fp:
+            fp.write(resp_body.encode('utf-8'))
+        debugp("Response body written to '%s'.\n" % tmpfile)
+
+    parser.feed(resp_body)
+
+    results = parser.results
+    for r in results:
+        r.print_entry()
+
+    if skipped:
+        if skipped == 1:
+            printerr("%d ad skipped." % skipped)
+        else:
+            printerr("%d ads skipped." % skipped)
+
+        skipped = 0
+
+    return results
+
+
+results = []
+while True:
+    if nav == "n" or nav == "p" or nav == "g":
+        results = fetch_results()
+
+    oldstart = start
+    try:
+        nav = show_omniprompt()
+    except EOFError:
+        nav = ""
+
+    if nav == "n":
+        if num is not None:
+            start = str(int(start) + int(num))
+        else:
+            start = str(int(start) + 10)
+        printerr("")
+    elif nav == "p":
+        if num is not None:
+            start = str(int(start) - int(num))
+        else:
+            start = str(int(start) - 10)
+        printerr("")
+    elif len(nav) > 2 and nav[0] == "g" and nav[1] == " ":
+        trimsearch = nav[2:].strip().replace(" ", "+")
+        if trimsearch == "":
+            printerr("Empty search. Exiting.")
+            break
+        url = baseurl + "q=" + trimsearch
+        debugp("New search URL [%s]" % url)
+        nav = "g"
+        start = basestart
+        printerr("")
+        continue
+    elif is_int(nav):
+        index = int(nav) - 1
+        if index < 0:
+            if index < -1:
+                printerr("Index out of bound.")
+            else:
+                printerr("Index out of bound. To search %s, try \'g %s\'." % (nav, nav))
+            continue
+
+        try:
+            results[index].open()
+        except IndexError:
+            printerr("Index out of bound. To search %s, try \'g %s\'." % (nav, nav))
+
+        continue
+    elif len(nav):
+        trimsearch = nav.strip().replace(" ", "+")
+        if trimsearch == "":
+            printerr("Empty search. Exiting.")
+            break
+        url = baseurl + "q=" + trimsearch
+        debugp("New search URL [%s]" % url)
+        nav = "g"
+        start = basestart
+        printerr("")
+        continue
+    else:
+        break
+
+    if int(start) < 0:
+        start = "0"
+
+    url = url.replace("start=" + oldstart + "&", "start=" + start + "&", 1)
+    debugp("Next URL [%s]\n" % url)
+
+conn.close()
